@@ -1,0 +1,453 @@
+---
+title: "Allgemeines Analyseskript"
+output:
+  html_document:
+    fig_caption: yes
+    number_sections: yes
+    toc: yes
+  pdf_document:
+    toc: yes
+---
+
+Dieses Knitr-Script analysiert eine SPSS Datei mithilfe einer descriptor.csv.
+Hierfür werden alle Variablen umbenannt und die markierten Variablen recodiert.
+Im nächsten Chunk werden vorhandene Skalen berechnet.
+
+
+```{r loaddata, echo=FALSE, warning=FALSE, message=FALSE, cache=FALSE}
+# Ggplot2 Paket laden
+require(ggplot2)
+require(plyr)
+require(dplyr)
+require(psych)
+require(foreign)
+require(stringr)
+require(data.table)
+require(DAAG)
+
+
+### reconvert factorial from an spss file. Import misuses value.labels
+recodeSPSSfactorials <- function(variable) {
+  descriptiveLabels <- names(attr(variable, "value.labels"))
+  codes <- as.numeric(attr(variable, "value.labels"))
+  result <- descriptiveLabels[codes[variable]]
+  as.factor(result)
+}
+
+
+
+## helper function for numeric factors that are coded as levels immediately
+as.numeric.factor <- function(x) {
+    as.numeric(levels(x))[x]
+  }
+
+
+###
+## Recode a numeric variable 6 Point Likert scale per default.
+recodeLikert <- function(x, pointScale = 6){
+  (pointScale+1)-x
+}
+
+########################################################################
+# creates a scale from a set of variables in a dataframe and names it
+# Outputs reliability analysis (set short to TRUE for summary)
+generateScale <- function(dataframe, variableSet, scaleName, likertSize = 6, short=FALSE){
+    #pick scale relevant data
+    scaleData <- dataframe[variableSet]
+    reliability <- alpha(scaleData,title=scaleName)
+    #print reliability information
+    if(short){summary(reliability)}
+    else{
+      print(reliability)
+    }
+    #perform item scores
+    results <- scoreItems(keys=rep(1, times=length(variableSet)), items = scaleData, 
+          totals = FALSE, missing = TRUE, min = 1, 
+                max = likertSize)
+    #re-attach new variable
+    dataframe <- cbind(dataframe,results$scores)
+    setnames(dataframe, old = "A1", new = scaleName)
+    
+  return(dataframe)
+}
+
+# Create Corr Plots for scale
+generateScalePlots <- function(dataframe, variableSet, scaleName) {
+    print("Iterkorrelationsplot") 
+   p <- corrplot.mixed(cor(dataframe[c(variableSet,scaleName)], use = "pairwise.complete.obs"), sig.level=0.05)
+    print("SkalenHistogram")
+    generateScaleHistogram(dataframe, scaleName)
+}
+
+# creates a p-value matrix
+cor.mtest <- function(mat, conf.level = 0.95) {
+    mat <- as.matrix(mat)
+    n <- ncol(mat)
+    p.mat <- lowCI.mat <- uppCI.mat <- matrix(NA, n, n)
+    diag(p.mat) <- 0
+    diag(lowCI.mat) <- diag(uppCI.mat) <- 1
+    for (i in 1:(n - 1)) {
+        for (j in (i + 1):n) {
+            tmp <- cor.test(mat[, i], mat[, j], conf.level = conf.level)
+            p.mat[i, j] <- p.mat[j, i] <- tmp$p.value
+            lowCI.mat[i, j] <- lowCI.mat[j, i] <- tmp$conf.int[1]
+            uppCI.mat[i, j] <- uppCI.mat[j, i] <- tmp$conf.int[2]
+        }
+    }
+    return(list(p.mat, lowCI.mat, uppCI.mat))
+}
+
+
+#create Corr Plot for a given variable set
+generateCorrPlots <- function(dataframe, variableSet, siglevel=0.05) {
+    dataframe[variableSet]=sapply(dataframe[variableSet],as.numeric)
+    #get r and p values
+    res <- cor.mtest(dataframe[c(variableSet)], conf.level=siglevel)
+    rvalues = cor(dataframe[c(variableSet)], use = "pairwise.complete.obs")
+    
+    p <- corrplot.mixed(rvalues, p.mat=res[[1]], sig.level=siglevel, tl.pos = "lt")
+}
+
+
+# THIS FUNCTION IS NOT EFFECTIVE. CORRPLOT Does not plot diagonals even if they exist
+#
+#create Corr Plot for two variable sets IV and DV
+generateIDCorrPlots <- function(dataframe, IV, DV, siglevel=0.05) {
+    dataframe[IV]=sapply(dataframe[IV],as.numeric)
+    dataframe[DV]=sapply(dataframe[DV],as.numeric)
+    #get r and p values
+    res <- cor.mtest(dataframe[c(IV,DV)], conf.level=siglevel)
+    rvalues <- cor(dataframe[c(IV,DV)], use = "pairwise.complete.obs")
+    IVlength <- length(IV)
+    DVlength <- length(DV)
+    newr <- rvalues[(IVlength+1):(IVlength+DVlength),1:IVlength]
+    newp <- res[[1]][(IVlength+1):(IVlength+DVlength),1:IVlength]
+    p <- corrplot(newr, p.mat=newp, sig.level=siglevel, tl.pos = "lt", method="number")
+}
+
+
+
+generateScaleHistogram <- function(dataframe, variableName) {
+  centralValues <- data.frame(names=c("Mean"), vals = c(mean(dataframe[[variableName]])))
+
+  titleHeader <- paste("Histogram for", variableName)
+  g <- ggplot(data, aes_string(variableName)) + geom_histogram(binwidth=0.5, origin=1)
+    g + labs(title=titleHeader, x=variableName, y="Frequency") + geom_vline(data=centralValues, mapping=aes(xintercept=vals), color="red") +
+    geom_text(data=centralValues,aes(x=vals, label=paste(names,vals,sep="="),y=-1), colour="red", angle=0, text=element_text(size=10))
+}
+
+
+
+
+#
+#
+#
+#
+#        PROGRAM STARTS HERE
+#
+#
+#
+
+
+
+
+##########################################################
+# files to analyze
+###
+filename <- "result 9.sav"
+descfilename <- "descriptor.csv"
+languageSelection <- "EN"
+languageColumn <- paste("label",languageSelection)
+##########################################################
+
+
+###
+### Beschreibung der Descriptor-datei
+### Format: csv mit Header
+###
+## column 1: surveymonkeyName
+## column 2: variableName
+## column 3: scaleInversion
+## column 4: labelEN
+## columb n: label<CountryCode>
+
+
+##########################################################
+# spss datei laden und descriptor datei laden
+###
+data <- read.spss(filename, to.data.frame=TRUE, use.value.labels = FALSE)
+descriptor <- read.csv(descfilename)
+
+# überflüssige spalten löschen
+keepcolumns <- as.character(descriptor$surveymonkeyName)
+data <- data[keepcolumns]
+#########################################################
+
+
+#########################################################
+# Skaleninvertierung wenn angegeben
+###
+
+#determine recodeVariables
+recodeVars <- as.character(descriptor$surveymonkeyName[which(as.logical(descriptor$scaleInversion))])
+#apply recoding
+datarecoded <- as.data.frame(lapply(data[recodeVars],recodeLikert))
+removeVars <- names(data) %in% recodeVars
+data <- data[!removeVars]
+data <- cbind(data,datarecoded)
+#########################################################
+
+#####
+# Variablenumbennenung
+####
+
+setnames(data, old = as.character(descriptor$surveymonkeyName), new = as.character(descriptor$variableName))
+
+#########################################################
+```
+
+#Skalen-Analysen
+
+##Analyse des KUT
+```{r KUT, echo=FALSE, message=FALSE}
+require(ggplot2)
+require(plyr)
+require(dplyr)
+require(psych)
+require(foreign)
+require(stringr)
+require(data.table)
+require(corrplot)
+###################### KUT analyse
+KUTvars <- c("KUT1", "KUT2", "KUT3", "KUT4", "KUT5", "KUT6", "KUT7", "KUT8")
+newScaleVariableName <- "KUT"
+data <- generateScale(data, variableSet = KUTvars, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = KUTvars, scaleName = newScaleVariableName)
+
+```
+
+##Analyse des Big Five
+```{r BigFive, echo=FALSE, message=FALSE}
+###################### Big5 analyse
+Big5E <- c("BFIVE1", "BFIVE6")
+Big5O <- c("BFIVE5", "BFIVE10")
+Big5C <- c("BFIVE3", "BFIVE8")
+Big5A <- c("BFIVE2", "BFIVE7")
+Big5N <- c("BFIVE4", "BFIVE9")
+
+newScaleVariableName <- "B5Extraversion"    
+data <- generateScale(data, variableSet = Big5E, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = Big5E, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "B5Conscientiousness"    
+data <- generateScale(data, variableSet = Big5C, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = Big5C, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "B5Openness"    
+data <- generateScale(data, variableSet = Big5O, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = Big5O, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "B5Neuroticism"    
+data <- generateScale(data, variableSet = Big5N, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = Big5N, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "B5Agreeableness"    
+data <- generateScale(data, variableSet = Big5A, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = Big5A, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "B5Conscienctiousness"
+data <- generateScale(data, variableSet=Big5C, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = Big5C, scaleName = newScaleVariableName)
+
+
+    
+# Confirmatory PCA and varimax rotation using 5 factors
+allvars <- c("BFIVE1","BFIVE2","BFIVE3","BFIVE4","BFIVE5","BFIVE6","BFIVE7","BFIVE8","BFIVE9","BFIVE10")    
+res <- prcomp(na.omit(data[allvars]),
+                 center = TRUE,
+                 scale. = TRUE) 
+varimax(res$rotation[,1:5])
+```
+
+
+##Analyse des Social Media UF
+```{r SMUF, echo=FALSE, message=FALSE}
+###################### SMUF analyse
+SMUF <- c("facebookUF", "xingUF", "linkedinUF", "twitterUF", "workSMUF")
+
+newScaleVariableName <- "SMUsageFrequency"
+data <- generateScale(data, variableSet= SMUF, scaleName = newScaleVariableName, likertSize = 6)
+generateScalePlots(data, variableSet = SMUF, scaleName = newScaleVariableName)
+```
+
+
+##Analyse des Like Button TAMs
+```{r Like Button, echo=FALSE, message=FALSE}
+###################### SMUF analyse
+likeButtonPEU <- c("likeTAM_PEU1", "likeTAM_PEU2", "likeTAM_PEU3", "likeTAM_PEU4", "likeTAM_PEU5", "likeTAM_PEU6")
+likeButtonPU <- c("likeTAM_PU1", "likeTAM_PU2", "likeTAM_PU3", "likeTAM_PU4", "likeTAM_PU5", "likeTAM_PU6")
+likeButtonBI <- c("likeTAM_BI1", "likeTAM_BI2", "likeTAM_BI3")
+
+
+newScaleVariableName <- "likePEU"
+data <- generateScale(data, variableSet= likeButtonPEU, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = likeButtonPEU, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "likePU"
+data <- generateScale(data, variableSet= likeButtonPU, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = likeButtonPU, scaleName = newScaleVariableName)
+
+
+newScaleVariableName <- "likeBI"
+data <- generateScale(data, variableSet= likeButtonBI, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = likeButtonBI, scaleName = newScaleVariableName)
+```
+
+##Analyse des Star Button TAM
+```{r Star Buttons, echo=FALSE, message=FALSE}
+###################### SMUF analyse
+starButtonPEU <- c("starTAM_PEU1", "starTAM_PEU2", "starTAM_PEU3", "starTAM_PEU4", "starTAM_PEU5", "starTAM_PEU6")
+starButtonPU <- c("starTAM_PU1", "starTAM_PU2", "starTAM_PU3", "starTAM_PU4", "starTAM_PU5", "starTAM_PU6")
+starButtonBI <- c("starTAM_BI1", "starTAM_BI2", "starTAM_BI3")
+
+
+newScaleVariableName <- "starPEU"
+data <- generateScale(data, variableSet= starButtonPEU, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = starButtonPEU, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "starPU"
+data <- generateScale(data, variableSet= starButtonPU, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = starButtonPU, scaleName = newScaleVariableName)
+
+
+newScaleVariableName <- "starBI"
+data <- generateScale(data, variableSet= starButtonBI, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = starButtonBI, scaleName = newScaleVariableName)
+```
+
+
+##Analyse des Tag Button TAM
+```{r Tag Buttons, echo=FALSE, message=FALSE}
+###################### SMUF analyse
+tagButtonPEU <- c("tagTAM_PEU1", "tagTAM_PEU2", "tagTAM_PEU3", "tagTAM_PEU4", "tagTAM_PEU5", "tagTAM_PEU6")
+tagButtonPU <- c("tagTAM_PU1", "tagTAM_PU2", "tagTAM_PU3", "tagTAM_PU4", "tagTAM_PU5", "tagTAM_PU6")
+tagButtonBI <- c("tagTAM_BI1", "tagTAM_BI2", "tagTAM_BI3")
+
+
+newScaleVariableName <- "tagPEU"
+data <- generateScale(data, variableSet= tagButtonPEU, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = tagButtonPEU, scaleName = newScaleVariableName)
+
+newScaleVariableName <- "tagPU"
+data <- generateScale(data, variableSet= tagButtonPU, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = tagButtonPU, scaleName = newScaleVariableName)
+
+
+newScaleVariableName <- "tagBI"
+data <- generateScale(data, variableSet= tagButtonBI, scaleName = newScaleVariableName)
+generateScalePlots(data, variableSet = tagButtonBI, scaleName = newScaleVariableName)
+```
+
+#Deskriptive Statistik
+## Demographische Daten
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+
+
+
+# AUSWERTUNG
+IVs <- c("gender","age","work","workduration","SMUsageFrequency", "KUT", "B5Extraversion", "B5Openness", "B5Conscientiousness", "B5Neuroticism", "B5Agreeableness")
+
+
+#Alle falschen Faktoren zu zahlen machen.
+data[IVs] <- sapply(data[IVs],as.numeric)
+
+IVData <- tbl_df(data[IVs])
+describe(IVData)
+
+summary(recodeSPSSfactorials(data$gender))
+summary(recodeSPSSfactorials(data$work))
+pairs.panels(data[IVs])
+outlier(data[IVs])
+error.bars(data[IVs])
+```
+
+###Korrelation der UVs
+```{r, echo=FALSE, message=FALSE, warning=FALSE,  fig.height=9, fig.width=9}
+
+generateCorrPlots(data,IVs)
+
+
+```
+
+
+## Abhängige Variablen
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+
+# AUSWERTUNG
+DVs <- c("likePEU","likePU","likeBI", "starPEU","starPU","starBI","tagPEU","tagPU","tagBI")
+
+#Alle falschen Faktoren zu zahlen machen.
+data[DVs] <- sapply(data[DVs],as.numeric)
+
+DVData <- tbl_df(data[DVs])
+describe(DVData)
+
+pairs.panels(data[DVs])
+outlier(data[DVs])
+error.bars(data[DVs])
+```
+
+###Korrelation der AVs
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.height=9, fig.width=9}
+
+generateCorrPlots(data,DVs)
+
+```
+
+### Lineare Modelle der AVs Like
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+fit <- lm(likeBI ~ likePEU + likePU , data=data)
+summary(fit) # show results
+plot(fit)
+cv.lm(data=data, fit, m=3)
+```
+
+### Lineare Modelle der AVs Star
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+fit <- lm(starBI ~ starPEU + starPU , data=data)
+summary(fit) # show results
+plot(fit)
+cv.lm(data=data, fit, m=3)
+```
+
+### Lineare Modelle der AVs Tag
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+fit <- lm(tagBI ~ tagPEU + tagPU , data=data)
+summary(fit) # show results
+plot(fit)
+cv.lm(data=data, fit, m=3)
+```
+
+
+#Explorative Hypothesentests (Korrelationen). 
+Links finden sich die Abhängigen Variablen, oben die Unabhängigen. Nicht-signifikante Korrelationen werden ausgekreuzt. Alpha = 0.05.
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.height=9, fig.width=9}
+
+generateIDCorrPlots(data,IVs,DVs,siglevel=0.05)
+
+
+
+```
+
+
+# Verfügbare Variablen im Datensatz
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+names(data)
+````
